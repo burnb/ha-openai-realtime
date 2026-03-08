@@ -10,6 +10,7 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
 from pipecat.transports.websocket.server import WebsocketServerTransport, WebsocketServerParams
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
+from pipecat.services.openai.realtime import events
 
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 from pipecat.frames.frames import Frame, InputAudioRawFrame, OutputAudioRawFrame, StartFrame, EndFrame
@@ -143,6 +144,14 @@ class WebSocketHandler:
         context_aggregator = None
         context_initializer = None
         if self.session_manager:
+            context_metrics = self.session_manager.get_cached_context_metrics(client_id)
+            logger.info(
+                "📦 Cached context for %s: %s messages, %s chars, ~%s tokens",
+                client_id,
+                context_metrics["messages"],
+                context_metrics["chars"],
+                context_metrics["approx_tokens"],
+            )
             context_aggregator = self.session_manager.create_context_aggregator(client_id)
             context_initializer = self.session_manager.create_context_initializer(client_id, context_aggregator)
         
@@ -181,6 +190,7 @@ class WebSocketHandler:
             pipeline_components.append(context_initializer)
         
         pipeline = Pipeline(pipeline_components)
+        self.pipeline = pipeline
         logger.info("✅ Pipeline created for WebSocket connection")
         
         # Audio recording is handled by AudioFrameRecorder processors in the pipeline
@@ -191,10 +201,9 @@ class WebSocketHandler:
         # Disable idle timeout - server should always stay ready for connections
         runner = PipelineRunner()
         task = PipelineTask(pipeline, idle_timeout_secs=None, cancel_on_idle_timeout=False)
-        
-        # Start pipeline in background
-        asyncio.create_task(runner.run(task))
-        logger.info("✅ Pipeline started for WebSocket connection")
+
+        self.runner = runner
+        self.current_task = task
         logger.info("✅ Pipeline initialized successfully")
         
         return pipeline, runner, task
@@ -277,25 +286,10 @@ class WebSocketHandler:
                             openai_service = openai_service_getter(client_id)
                         
                         if openai_service:
-                            # Send interrupt event to OpenAI Realtime API
-                            # The interrupt event tells OpenAI to stop speaking and listen for user input
                             try:
-                                # Try to send interrupt event directly to the service
-                                # OpenAI Realtime API expects: {"type": "response.interrupt"}
-                                if hasattr(openai_service, 'send_interrupt'):
-                                    await openai_service.send_interrupt()
-                                    logger.info(f"✅ Interrupt sent to OpenAI service for client {client_id}")
-                                elif hasattr(openai_service, 'push_event'):
-                                    # Send interrupt event via push_event
-                                    await openai_service.push_event({"type": "response.interrupt"})
-                                    logger.info(f"✅ Interrupt event sent to OpenAI service for client {client_id}")
-                                elif hasattr(openai_service, '_send_event'):
-                                    # Try private method if available
-                                    await openai_service._send_event({"type": "response.interrupt"})
-                                    logger.info(f"✅ Interrupt sent via _send_event to OpenAI service for client {client_id}")
-                                else:
-                                    # Fallback: log warning
-                                    logger.warning(f"⚠️ Could not find method to send interrupt to OpenAI service. Available methods: {[m for m in dir(openai_service) if not m.startswith('__')]}")
+                                await openai_service.send_client_event(events.ResponseCancelEvent())
+                                await openai_service.broadcast_interruption()
+                                logger.info(f"✅ Cancelled active OpenAI response for client {client_id}")
                             except Exception as e:
                                 logger.error(f"❌ Error sending interrupt to OpenAI service: {e}", exc_info=True)
                         else:
@@ -311,12 +305,6 @@ class WebSocketHandler:
     
     async def cleanup(self):
         """Cleanup WebSocket handler resources."""
-        if self.runner:
-            try:
-                await self.runner.cancel()
-            except Exception as e:
-                logger.warning(f"⚠️ Error cancelling runner: {e}")
-        
         if self.transport:
             try:
                 if hasattr(self.transport, 'stop'):

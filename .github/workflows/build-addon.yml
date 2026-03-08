@@ -89,8 +89,6 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.arch }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          build-args: |
-            BUILD_FROM=ghcr.io/home-assistant/${{ matrix.arch }}-base:latest
 
       - name: Generate image manifest
         if: github.event_name != 'pull_request' && matrix.arch == 'amd64'

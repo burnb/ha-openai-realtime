@@ -1,7 +1,8 @@
 """Session management with context caching for OpenAI Realtime API."""
+import json
 import logging
 import time
-from typing import Optional, Dict
+from typing import Optional, Dict, List, Any
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
@@ -27,13 +28,15 @@ class SessionManager:
     closed within the reuse timeout period.
     """
     
-    def __init__(self, reuse_timeout: float = 300.0):
+    def __init__(self, reuse_timeout: float = 300.0, max_cached_messages: int = 8):
         """Initialize session manager.
         
         Args:
             reuse_timeout: Time in seconds after which cached context expires
+            max_cached_messages: Maximum number of recent messages to carry over
         """
         self.reuse_timeout = reuse_timeout
+        self.max_cached_messages = max_cached_messages
         # Dictionary mapping client_id to ContextCacheEntry
         self.context_caches: Dict[str, ContextCacheEntry] = {}
         # Dictionary mapping client_id to current service
@@ -90,7 +93,12 @@ class SessionManager:
         # Cache the context if we found one
         if context:
             messages = context.get_messages() if hasattr(context, 'get_messages') else []
-            message_count = len(messages) if messages else 0
+            pruned_messages = self._prune_messages(messages)
+            message_count = len(pruned_messages)
+            if hasattr(context, 'set_messages'):
+                context.set_messages(pruned_messages)
+            elif hasattr(context, '_messages'):
+                context._messages = pruned_messages
             self.context_caches[client_id] = ContextCacheEntry(
                 context=context,
                 timestamp=time.time()
@@ -127,7 +135,7 @@ class SessionManager:
         if cached_context:
             # Create a new context instance with the same messages
             # Use the constructor to properly copy messages and tools
-            cached_messages = cached_context.get_messages()
+            cached_messages = self._prune_messages(cached_context.get_messages())
             new_context = LLMContext(
                 messages=cached_messages.copy() if cached_messages else None,
                 tools=cached_context.tools if hasattr(cached_context, 'tools') else None,
@@ -207,6 +215,46 @@ class SessionManager:
         aggregator_pair = LLMContextAggregatorPair(context)
         self.set_context_aggregator(client_id, aggregator_pair)
         return aggregator_pair
+
+    def get_cached_context_metrics(self, client_id: str) -> Dict[str, int]:
+        """Return approximate size metrics for cached context for diagnostics."""
+        cached_context = self.get_cached_context(client_id)
+        messages = cached_context.get_messages() if cached_context and hasattr(cached_context, 'get_messages') else []
+        pruned_messages = self._prune_messages(messages)
+        total_chars = sum(self._message_size_chars(message) for message in pruned_messages)
+        return {
+            "messages": len(pruned_messages),
+            "chars": total_chars,
+            "approx_tokens": self._approx_tokens(total_chars),
+        }
+
+    def _prune_messages(self, messages: Optional[List[Any]]) -> List[Any]:
+        """Keep only the most recent messages to control token growth."""
+        if not messages:
+            return []
+        if self.max_cached_messages <= 0:
+            return []
+        if len(messages) <= self.max_cached_messages:
+            return list(messages)
+        return list(messages[-self.max_cached_messages:])
+
+    def _message_size_chars(self, message: Any) -> int:
+        """Estimate message size in characters for logging."""
+        if isinstance(message, str):
+            return len(message)
+        if isinstance(message, dict):
+            try:
+                return len(json.dumps(message, ensure_ascii=False))
+            except TypeError:
+                return len(str(message))
+        try:
+            return len(json.dumps(message, ensure_ascii=False))
+        except TypeError:
+            return len(str(message))
+
+    def _approx_tokens(self, char_count: int) -> int:
+        """Approximate token count from character count."""
+        return max(1, (char_count + 3) // 4) if char_count else 0
     
     def create_context_initializer(self, client_id: str, context_aggregator: LLMContextAggregatorPair) -> Optional['ContextInitializer']:
         """Create a context initializer if cached messages exist.

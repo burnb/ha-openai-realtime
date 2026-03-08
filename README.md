@@ -33,7 +33,7 @@ This repository contains two main components:
 
 - **Immediate Response**: After wake word detection, you can speak immediately without waiting
 - **Natural Conversation Flow**: During silence, you can continue speaking naturally - the assistant listens continuously
-- **Interruption Handling**: User input during assistant responses is ignored, except for wake words which can interrupt
+- **Interruption Handling**: Assistant playback can be interrupted by speaking over it; the device keeps streaming microphone audio and sends an interrupt as soon as local speech is detected during TTS
 - **Stop Words**: Conversation ends when a stop word is detected (e.g., "thank you", "stop") using a dedicated tool
 - **Session Continuity**: Previous conversation history is maintained when a new wake word is spoken within the session reuse timeout period after the last conversation ended
 - **Wake Word Restart**: After a conversation ends, a new wake word starts a fresh interaction while preserving context within the timeout window

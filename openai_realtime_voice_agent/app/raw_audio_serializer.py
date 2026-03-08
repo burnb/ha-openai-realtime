@@ -1,20 +1,15 @@
 """Simple serializer for raw binary PCM audio frames."""
 import logging
 from pipecat.frames.frames import InputAudioRawFrame, OutputAudioRawFrame, Frame
-from pipecat.serializers.base_serializer import FrameSerializer, FrameSerializerType
+from pipecat.serializers.base_serializer import FrameSerializer
 
 logger = logging.getLogger(__name__)
 
 
 class RawAudioSerializer(FrameSerializer):
     """Serializer that treats all binary messages as raw PCM audio."""
-    
-    @property
-    def type(self) -> FrameSerializerType:
-        """Get the serialization type - binary for raw audio."""
-        return FrameSerializerType.BINARY
-    
-    async def deserialize(self, message: bytes) -> InputAudioRawFrame:
+
+    async def deserialize(self, message: str | bytes) -> InputAudioRawFrame | None:
         """Deserialize binary message as raw PCM audio frame.
         
         Args:
@@ -42,17 +37,17 @@ class RawAudioSerializer(FrameSerializer):
         
         return frame
     
-    async def serialize(self, frame: Frame) -> bytes:
+    async def serialize(self, frame: Frame) -> bytes | None:
         """Serialize frame to binary message.
         
         For output audio frames, we just return the raw audio bytes.
-        Other frames are not serialized (return empty bytes).
+        Other frames are not serialized.
         """
         if isinstance(frame, OutputAudioRawFrame):
             audio_bytes = frame.audio
             logger.debug(f"📤 Serializing OutputAudioRawFrame: {len(audio_bytes)} bytes")
             return audio_bytes
-        # For other frame types, return empty bytes (not serialized)
-        logger.debug(f"📤 Serializing non-audio frame: {type(frame).__name__}, returning empty bytes")
-        return b""
+        # Let the transport skip frames that are not raw output audio.
+        logger.debug(f"📤 Skipping non-audio frame during serialization: {type(frame).__name__}")
+        return None
 

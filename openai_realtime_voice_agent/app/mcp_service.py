@@ -1,6 +1,6 @@
 """MCP service integration using Pipecat's MCPClient with StreamableHTTP."""
 import logging
-from typing import Optional
+from typing import List, Optional
 from pipecat.services.mcp_service import MCPClient, StreamableHttpParameters
 
 logger = logging.getLogger(__name__)
@@ -9,16 +9,18 @@ logger = logging.getLogger(__name__)
 class HomeAssistantMCPService:
     """Home Assistant MCP service using Pipecat's MCPClient."""
     
-    def __init__(self, url: str, access_token: str):
+    def __init__(self, url: str, access_token: str, tools_filter: Optional[List[str]] = None):
         """
         Initialize Home Assistant MCP service.
         
         Args:
             url: Home Assistant MCP Server URL (e.g., http://supervisor/core/api/mcp)
             access_token: Long-lived access token for Home Assistant
+            tools_filter: Optional list of MCP tool names to register
         """
         self.url = url
         self.access_token = access_token
+        self.tools_filter = tools_filter
         self.mcp_client: Optional[MCPClient] = None
         
     async def initialize(self) -> MCPClient:
@@ -35,7 +37,10 @@ class HomeAssistantMCPService:
             )
             
             # Create MCP client
-            self.mcp_client = MCPClient(server_params=server_params)
+            self.mcp_client = MCPClient(
+                server_params=server_params,
+                tools_filter=self.tools_filter,
+            )
             
             logger.info("✅ Home Assistant MCP Client initialized")
             return self.mcp_client

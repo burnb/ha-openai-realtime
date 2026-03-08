@@ -2,6 +2,7 @@
 import os
 import sys
 import asyncio
+import json
 import logging
 from typing import Optional
 import dotenv
@@ -10,6 +11,8 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 from pipecat.transports.websocket.server import WebsocketServerTransport
+from app.guarded_openai_service import GuardedOpenAIRealtimeLLMService
+from app.home_assistant_context import HomeAssistantContextService
 from app.mcp_service import HomeAssistantMCPService
 from app.disconnect_tool import get_disconnect_tool_definition, create_disconnect_tool_handler
 from app.audio_recording_service import AudioRecordingService
@@ -42,6 +45,7 @@ class Application:
         self.websocket_transport: Optional[WebsocketServerTransport] = None
         self.openai_service: Optional[OpenAIRealtimeLLMService] = None
         self.mcp_service: Optional[HomeAssistantMCPService] = None
+        self.ha_context_service: Optional[HomeAssistantContextService] = None
         self.audio_recording_service: Optional[AudioRecordingService] = None
         self.session_manager: Optional[SessionManager] = None
         self.current_task: Optional[PipelineTask] = None
@@ -51,6 +55,10 @@ class Application:
         """Initialize all components."""
         # Get configuration from environment
         openai_api_key = os.environ.get("OPENAI_API_KEY")
+        openai_model = os.environ.get("OPENAI_MODEL", "gpt-realtime-mini")
+        openai_voice = os.environ.get("OPENAI_VOICE", "ash")
+        openai_sst_model = os.environ.get("OPENAI_SST_MODEL", "gpt-4o-mini-transcribe")
+        openai_sst_language = os.environ.get("OPENAI_SST_LANGUAGE", "") or None
         websocket_port = int(os.environ.get("WEBSOCKET_PORT", "8080"))
         websocket_host = os.environ.get("WEBSOCKET_HOST", "0.0.0.0")
         
@@ -60,15 +68,21 @@ class Application:
         vad_silence_duration_ms = int(os.environ.get("VAD_SILENCE_DURATION_MS", "500"))
         
         # Get instructions with default
-        instructions = os.environ.get("INSTRUCTIONS", "You are the Home Assistant Voice Agent and can control the Smart Home.")
+        instructions = os.environ.get("INSTRUCTIONS", "You are the voice assistant 'Валера' for Home Assistant. You can control the Smart Home. Answer questions about the world truthfully. Keep it simple and to the point.")
+        mcp_tool_filter = self._parse_mcp_tool_filter(os.environ.get("HA_MCP_TOOL_FILTER", ""))
         
         # Get recording setting (optional, defaults to false)
         enable_recording = os.environ.get("ENABLE_RECORDING", "false").lower() == "true"
         
         # Get session reuse timeout and initialize session manager
-        session_reuse_timeout = float(os.environ.get("SESSION_REUSE_TIMEOUT_SECONDS", "300"))
-        self.session_manager = SessionManager(reuse_timeout=session_reuse_timeout)
+        session_reuse_timeout = float(os.environ.get("SESSION_REUSE_TIMEOUT_SECONDS", "120"))
+        max_cached_messages = int(os.environ.get("MAX_CACHED_MESSAGES", "5"))
+        self.session_manager = SessionManager(
+            reuse_timeout=session_reuse_timeout,
+            max_cached_messages=max_cached_messages,
+        )
         logger.info(f"Session reuse timeout: {session_reuse_timeout} seconds")
+        logger.info(f"Max cached messages per client: {max_cached_messages}")
         
         if not openai_api_key:
             raise ValueError("OPENAI_API_KEY environment variable is required")
@@ -80,8 +94,20 @@ class Application:
             ha_mcp_url = os.environ.get("HA_MCP_URL", "http://supervisor/core/api/mcp")
             if supervisor_token:
                 logger.info("Loading Home Assistant MCP tools...")
-                self.mcp_service = HomeAssistantMCPService(url=ha_mcp_url, access_token=supervisor_token)
+                self.mcp_service = HomeAssistantMCPService(
+                    url=ha_mcp_url,
+                    access_token=supervisor_token,
+                    tools_filter=mcp_tool_filter,
+                )
+                self.ha_context_service = HomeAssistantContextService(
+                    mcp_url=ha_mcp_url,
+                    access_token=supervisor_token,
+                )
                 mcp_client = await self.mcp_service.initialize()
+                dynamic_instructions = await self._build_home_assistant_instructions(instructions)
+                if dynamic_instructions != instructions:
+                    logger.info("✅ Home Assistant area/entity context appended to instructions")
+                instructions = dynamic_instructions
                 logger.info("✅ Home Assistant MCP Client initialized")
             else:
                 logger.warning("⚠️ SUPERVISOR_TOKEN not set, skipping Home Assistant MCP integration")
@@ -99,6 +125,10 @@ class Application:
         
         # Store configuration for session creation
         self.openai_api_key = openai_api_key
+        self.openai_voice = openai_voice
+        self.openai_model = openai_model
+        self.openai_sst_model = openai_sst_model
+        self.openai_sst_language = openai_sst_language
         self.vad_threshold = vad_threshold
         self.vad_prefix_padding_ms = vad_prefix_padding_ms
         self.vad_silence_duration_ms = vad_silence_duration_ms
@@ -114,6 +144,50 @@ class Application:
         )
         
         logger.info("✅ Application initialized - ready to accept WebSocket connections")
+
+    async def _build_home_assistant_instructions(self, base_instructions: str) -> str:
+        """Append Home Assistant area/entity context to the base instructions."""
+        if not self.ha_context_service:
+            return base_instructions
+
+        snapshot = await self.ha_context_service.fetch_snapshot()
+        if not snapshot:
+            return base_instructions
+
+        return f"{base_instructions.rstrip()}{snapshot.to_instructions()}"
+
+    def _parse_mcp_tool_filter(self, raw_value: str) -> Optional[list[str]]:
+        """Parse comma-separated MCP tool names from the environment."""
+        tool_names = [tool.strip() for tool in raw_value.split(",") if tool.strip()]
+        if tool_names:
+            logger.info("MCP tool filter enabled: %s", tool_names)
+            return tool_names
+        return None
+
+    def _approx_tokens_from_chars(self, char_count: int) -> int:
+        """Approximate token count from character count."""
+        return max(1, (char_count + 3) // 4) if char_count else 0
+
+    def _log_session_payload_metrics(self, tools: list[dict], client_id: Optional[str]) -> None:
+        """Log approximate prompt size contributors before session creation."""
+        instructions_chars = len(self.instructions)
+        tools_chars = len(json.dumps(tools, ensure_ascii=False))
+        cached_metrics = {"messages": 0, "chars": 0, "approx_tokens": 0}
+        if client_id and self.session_manager:
+            cached_metrics = self.session_manager.get_cached_context_metrics(client_id)
+
+        logger.info(
+            "📊 Session payload estimate for %s: instructions=%s chars (~%s tokens), tools=%s chars (~%s tokens, %s tools), cached_context=%s messages / %s chars (~%s tokens)",
+            client_id or "server",
+            instructions_chars,
+            self._approx_tokens_from_chars(instructions_chars),
+            tools_chars,
+            self._approx_tokens_from_chars(tools_chars),
+            len(tools),
+            cached_metrics["messages"],
+            cached_metrics["chars"],
+            cached_metrics["approx_tokens"],
+        )
     
     def _build_pipeline_for_transport(self, transport: WebsocketServerTransport, client_id: str):
         """
@@ -140,31 +214,22 @@ class Application:
         pass
     
     async def _ensure_openai_service(self, client_id: Optional[str] = None):
-        """Create a new OpenAI service instance for a client.
+        """Create or reuse the OpenAI service instance used by the pipeline.
         
         Args:
-            client_id: Optional client ID for session management
+            client_id: Optional client ID to associate with the active service
         """
         if self._pipeline_lock is None:
             self._pipeline_lock = asyncio.Lock()
         
         async with self._pipeline_lock:
-            if client_id is None:
-                logger.warning("⚠️ No client_id provided to _ensure_openai_service")
-            
-            # Create new session
-            if client_id:
-                logger.info(f"🆕 Creating new OpenAI Session for Client {client_id}...")
-            else:
-                logger.info("🆕 Creating new OpenAI Session...")
-            
-            # Cache context from old service before creating new one
-            if client_id and self.openai_service is not None:
-                try:
-                    self.session_manager.cleanup_before_new_session(client_id)
-                    logger.debug(f"Cached context from previous session for client {client_id}")
-                except Exception as e:
-                    logger.warning(f"⚠️ Error caching context from old service for client {client_id}: {e}")
+            if self.openai_service is not None:
+                if client_id and self.session_manager:
+                    self.session_manager.set_current_service(client_id, self.openai_service)
+                    logger.info(f"♻️ Reusing active OpenAI session for client {client_id}")
+                return self.openai_service
+
+            logger.info("🆕 Creating OpenAI session for the pipeline...")
             
             # Create session properties with audio configuration
             from pipecat.services.openai.realtime.events import (
@@ -172,7 +237,9 @@ class Application:
                 AudioConfiguration,
                 AudioInput,
                 AudioOutput,
-                TurnDetection
+                TurnDetection,
+                InputAudioTranscription,
+                InputAudioNoiseReduction
             )
             
             # Create disconnect tool definition
@@ -215,19 +282,26 @@ class Application:
                             threshold=self.vad_threshold,
                             prefix_padding_ms=self.vad_prefix_padding_ms,
                             silence_duration_ms=self.vad_silence_duration_ms
-                        )
+                        ),
+                        transcription=InputAudioTranscription(
+                            model=self.openai_sst_model,
+                            language=self.openai_sst_language
+                        ),
+                        noise_reduction=InputAudioNoiseReduction(type="far_field")
                     ),
-                    output=AudioOutput(voice="marin")
+                    output=AudioOutput(voice=self.openai_voice)
                 ),
                 tools=all_tools
             )
+
+            self._log_session_payload_metrics(all_tools, client_id)
             
             logger.info(f"🔧 Creating session with {len(all_tools)} tools: {[tool.get('name', 'unknown') for tool in all_tools]}")
             
             # Create new service instance
-            self.openai_service = OpenAIRealtimeLLMService(
+            self.openai_service = GuardedOpenAIRealtimeLLMService(
                 api_key=self.openai_api_key,
-                model="gpt-realtime",
+                model=self.openai_model,
                 session_properties=session_properties,
                 start_audio_paused=False
             )
@@ -257,7 +331,6 @@ class Application:
         """Run the application."""
         await self.initialize()
         
-        # Create initial OpenAI service (will be replaced per connection)
         await self._ensure_openai_service()
         
         # Build pipeline - based on pipecat-examples, one pipeline handles all connections
@@ -282,7 +355,9 @@ class Application:
         def get_openai_service_for_client(client_id: str) -> Optional[OpenAIRealtimeLLMService]:
             """Get OpenAI service for a specific client."""
             if self.session_manager:
-                return self.session_manager.get_current_service(client_id)
+                service = self.session_manager.get_current_service(client_id)
+                if service is not None:
+                    return service
             return self.openai_service
         
         self.websocket_handler.setup_event_handlers(

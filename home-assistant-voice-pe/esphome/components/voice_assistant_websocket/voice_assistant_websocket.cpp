@@ -137,6 +137,11 @@ void VoiceAssistantWebSocket::dump_config() {
   ESP_LOGCONFIG(TAG, "  Microphone: %s", this->microphone_ ? "Yes" : "No");
   ESP_LOGCONFIG(TAG, "  Speaker: %s", this->speaker_ ? "Yes" : "No");
   ESP_LOGCONFIG(TAG, "  Max Queue Size: %zu chunks", MAX_QUEUE_SIZE);
+  ESP_LOGCONFIG(TAG, "  Auto Interrupt: mean_abs>=%u, peak>=%u, chunks=%u, cooldown=%ums",
+                USER_SPEECH_MEAN_ABS_THRESHOLD,
+                USER_SPEECH_PEAK_THRESHOLD,
+                AUTO_INTERRUPT_REQUIRED_CHUNKS,
+                AUTO_INTERRUPT_COOLDOWN_MS);
 }
 
 void VoiceAssistantWebSocket::start() {
@@ -156,6 +161,8 @@ void VoiceAssistantWebSocket::start() {
   
   // Reset interrupt time
   this->interrupt_time_ = 0;
+  this->last_interrupt_sent_time_ = 0;
+  this->consecutive_user_speech_chunks_ = 0;
   
   // Start microphone first (if not already running)
   // Note: micro_wake_word also uses this microphone, so it might already be running
@@ -210,6 +217,8 @@ void VoiceAssistantWebSocket::stop() {
   while (!this->audio_queue_.empty()) {
     this->audio_queue_.pop();
   }
+
+  this->consecutive_user_speech_chunks_ = 0;
   
   if (this->state_callback_) {
     this->state_callback_(this->state_);
@@ -462,11 +471,6 @@ void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &da
     return;
   }
   
-  // Block microphone audio if bot is currently speaking
-  if (this->is_bot_speaking()) {
-    return;  // Don't send microphone audio while bot is speaking
-  }
-  
   // Microphone is configured for 16kHz, 32-bit, stereo (required by micro_wake_word)
   // OpenAI expects 24kHz, 16-bit, mono (non-beta API requirement)
   // Convert: 32-bit stereo -> 16-bit mono (16kHz) -> resample to 24kHz
@@ -484,6 +488,11 @@ void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &da
   for (size_t i = 0; i < stereo_32bit_samples; i++) {
     int32_t left_sample = stereo_32bit[i * 2];
     mono_16bit[i] = static_cast<int16_t>((left_sample >> 16));
+  }
+
+  if (this->should_auto_interrupt_(mono_16bit, mono_16khz_samples)) {
+    ESP_LOGI(TAG, "Detected user speech during assistant playback, sending interrupt");
+    this->interrupt();
   }
   
   // Resample from 16kHz to 24kHz (1.5x upsampling)
@@ -515,6 +524,55 @@ void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &da
   this->send_audio_chunk_(reinterpret_cast<const uint8_t *>(resampled_24khz), resampled_bytes);
 }
 
+bool VoiceAssistantWebSocket::detect_user_speech_(const int16_t *samples, size_t sample_count) const {
+  if (samples == nullptr || sample_count == 0) {
+    return false;
+  }
+
+  uint64_t absolute_sum = 0;
+  uint32_t peak_amplitude = 0;
+
+  for (size_t i = 0; i < sample_count; i++) {
+    int32_t sample = samples[i];
+    uint32_t amplitude = static_cast<uint32_t>(sample < 0 ? -sample : sample);
+    absolute_sum += amplitude;
+    peak_amplitude = std::max(peak_amplitude, amplitude);
+  }
+
+  uint32_t mean_amplitude = static_cast<uint32_t>(absolute_sum / sample_count);
+  return mean_amplitude >= USER_SPEECH_MEAN_ABS_THRESHOLD && peak_amplitude >= USER_SPEECH_PEAK_THRESHOLD;
+}
+
+bool VoiceAssistantWebSocket::should_auto_interrupt_(const int16_t *samples, size_t sample_count) {
+  if (!this->is_bot_speaking()) {
+    this->consecutive_user_speech_chunks_ = 0;
+    return false;
+  }
+
+  uint32_t now = millis();
+  if (this->last_interrupt_sent_time_ > 0 &&
+      (now - this->last_interrupt_sent_time_) < AUTO_INTERRUPT_COOLDOWN_MS) {
+    this->consecutive_user_speech_chunks_ = 0;
+    return false;
+  }
+
+  if (!this->detect_user_speech_(samples, sample_count)) {
+    this->consecutive_user_speech_chunks_ = 0;
+    return false;
+  }
+
+  if (this->consecutive_user_speech_chunks_ < AUTO_INTERRUPT_REQUIRED_CHUNKS) {
+    this->consecutive_user_speech_chunks_++;
+  }
+
+  if (this->consecutive_user_speech_chunks_ < AUTO_INTERRUPT_REQUIRED_CHUNKS) {
+    return false;
+  }
+
+  this->consecutive_user_speech_chunks_ = 0;
+  return true;
+}
+
 bool VoiceAssistantWebSocket::is_bot_speaking() const {
   // Bot is considered speaking if we received audio within the last 500ms
   if (this->last_speaker_audio_time_ == 0) {
@@ -540,6 +598,8 @@ void VoiceAssistantWebSocket::interrupt() {
     ESP_LOGW(TAG, "Failed to send interrupt message");
   } else {
     ESP_LOGI(TAG, "Interrupt message sent successfully");
+    this->last_interrupt_sent_time_ = millis();
+    this->consecutive_user_speech_chunks_ = 0;
     // Stop speaker immediately after sending interrupt
     if (this->speaker_ != nullptr) {
       this->speaker_->stop();
