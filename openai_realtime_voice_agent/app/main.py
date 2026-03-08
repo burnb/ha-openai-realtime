@@ -97,7 +97,7 @@ class Application:
                 self.mcp_service = HomeAssistantMCPService(
                     url=ha_mcp_url,
                     access_token=supervisor_token,
-                    tools_filter=mcp_tool_filter,
+                    excluded_tools=mcp_tool_filter,
                 )
                 self.ha_context_service = HomeAssistantContextService(
                     mcp_url=ha_mcp_url,
@@ -157,10 +157,10 @@ class Application:
         return f"{base_instructions.rstrip()}{snapshot.to_instructions()}"
 
     def _parse_mcp_tool_filter(self, raw_value: str) -> Optional[list[str]]:
-        """Parse comma-separated MCP tool names from the environment."""
+        """Parse comma-separated MCP tool names to exclude from the environment."""
         tool_names = [tool.strip() for tool in raw_value.split(",") if tool.strip()]
         if tool_names:
-            logger.info("MCP tool filter enabled: %s", tool_names)
+            logger.info("MCP tool exclude filter enabled: %s", tool_names)
             return tool_names
         return None
 
@@ -254,6 +254,8 @@ class Application:
                 try:
                     logger.info("🔧 Fetching MCP tool definitions...")
                     mcp_tools_schema = await self.mcp_client.get_tools_schema()
+                    if self.mcp_service:
+                        mcp_tools_schema = self.mcp_service.filter_tools_schema(mcp_tools_schema)
                     
                     # Convert MCP tool schemas to OpenAI format
                     for function_schema in mcp_tools_schema.standard_tools:
