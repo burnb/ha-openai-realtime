@@ -68,7 +68,7 @@ class Application:
         vad_silence_duration_ms = int(os.environ.get("VAD_SILENCE_DURATION_MS", "500"))
         
         # Get instructions with default
-        instructions = os.environ.get("INSTRUCTIONS", "You are the voice assistant 'Валера' for Home Assistant. You can control the Smart Home. Answer questions about the world truthfully. Keep it simple and to the point.")
+        instructions = os.environ.get("INSTRUCTIONS", "You are the Home Assistant Voice Agent and can control the Smart Home.")
         mcp_tool_filter = self._parse_mcp_tool_filter(os.environ.get("HA_MCP_TOOL_FILTER", ""))
         
         # Get recording setting (optional, defaults to false)
@@ -106,8 +106,9 @@ class Application:
                 mcp_client = await self.mcp_service.initialize()
                 dynamic_instructions = await self._build_home_assistant_instructions(instructions)
                 if dynamic_instructions != instructions:
-                    logger.info("✅ Home Assistant area/entity context appended to instructions")
+                    logger.info("✅ Home Assistant exposed-entity context appended to instructions")
                 instructions = dynamic_instructions
+                logger.info("Full session instructions:\n%s", instructions)
                 logger.info("✅ Home Assistant MCP Client initialized")
             else:
                 logger.warning("⚠️ SUPERVISOR_TOKEN not set, skipping Home Assistant MCP integration")
@@ -146,7 +147,7 @@ class Application:
         logger.info("✅ Application initialized - ready to accept WebSocket connections")
 
     async def _build_home_assistant_instructions(self, base_instructions: str) -> str:
-        """Append Home Assistant area/entity context to the base instructions."""
+        """Append exposed Home Assistant voice-assistant context to the base instructions."""
         if not self.ha_context_service:
             return base_instructions
 

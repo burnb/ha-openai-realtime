@@ -495,10 +495,9 @@ light:
               brightness_step = 0;
               brightness_increasing = true;
             }
-            // Blue color (0, 0, 255)
-            Color blue(0, 0, 255);
+            Color white(255, 255, 255);
             uint8_t brightness = (brightness_step * 255) / brightness_steps;
-            Color pulse_color = blue * brightness;
+            Color pulse_color = white * brightness;
             for (uint8_t i = 0; i < 12; i++) {
               it[i] = pulse_color;
             }
@@ -584,10 +583,10 @@ light:
     restore_mode: RESTORE_DEFAULT_OFF
     initial_state:
       color_mode: rgb
-      brightness: 66%
-      red: 9.4%
-      green: 73.3%
-      blue: 94.9%
+      brightness: 50%
+      red: 1
+      green: 1
+      blue: 1
     segments:
       - id: leds_internal
         from: 7
@@ -688,10 +687,10 @@ script:
             wifi.connected:
           then:
             - light.turn_on:
-                brightness: 66%
-                red: 9.4%
-                green: 73.3%
-                blue: 94.9%
+                brightness: 10%
+                red: 1
+                green: 1
+                blue: 1
                 id: voice_assistant_leds
                 effect: "Twinkle"
           else:
@@ -707,10 +706,10 @@ script:
   - id: control_leds_no_ha_connection_state
     then:
       - light.turn_on:
-          brightness: 66%
+          brightness: 30%
           red: 1
-          green: 0
-          blue: 0
+          green: 1
+          blue: 1
           id: voice_assistant_leds
           effect: "Twinkle"
 
@@ -728,10 +727,10 @@ script:
           then:
             # Voice assistant is active and connected - show blue pulse
             - light.turn_on:
-                brightness: 66%
-                red: 0%
-                green: 0%
-                blue: 100%
+                brightness: 100%
+                red: 1
+                green: 1
+                blue: 1
                 id: voice_assistant_leds
                 effect: "Active Pulse"
           else:
@@ -811,8 +810,8 @@ script:
       - light.turn_on:
           brightness: 66%
           red: 1
-          green: 0
-          blue: 0
+          green: 1
+          blue: 1
           id: voice_assistant_leds
           effect: "Twinkle"
 

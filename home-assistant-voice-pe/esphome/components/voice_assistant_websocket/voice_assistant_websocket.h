@@ -62,8 +62,6 @@ class VoiceAssistantWebSocket : public Component {
   void send_audio_chunk_(const uint8_t *data, size_t len);
   void process_received_audio_(const uint8_t *data, size_t len);
   void on_microphone_data_(const std::vector<uint8_t> &data);
-  bool detect_user_speech_(const int16_t *samples, size_t sample_count) const;
-  bool should_auto_interrupt_(const int16_t *samples, size_t sample_count);
   static void websocket_event_handler_(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
   void handle_websocket_event_(esp_websocket_event_id_t event_id, esp_websocket_event_data_t *event_data);
   
@@ -125,12 +123,6 @@ class VoiceAssistantWebSocket : public Component {
   uint32_t last_reconnect_attempt_{0};
   uint32_t interrupt_time_{0};  // Time when interrupt was sent (to ignore audio for a short period)
   static const uint32_t INTERRUPT_IGNORE_AUDIO_MS = 500;  // Ignore audio for 500ms after interrupt
-  uint32_t last_interrupt_sent_time_{0};
-  uint8_t consecutive_user_speech_chunks_{0};
-  static const uint32_t AUTO_INTERRUPT_COOLDOWN_MS = 1200;
-  static const uint8_t AUTO_INTERRUPT_REQUIRED_CHUNKS = 2;
-  static const uint32_t USER_SPEECH_MEAN_ABS_THRESHOLD = 900;
-  static const uint32_t USER_SPEECH_PEAK_THRESHOLD = 2600;
 };
 
 // Action classes for automations (defined outside the main class)
@@ -185,4 +177,3 @@ template<typename... Ts> class VoiceAssistantWebSocketInterruptAction : public A
 
 }  // namespace voice_assistant_websocket
 }  // namespace esphome
-

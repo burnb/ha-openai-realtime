@@ -43,7 +43,7 @@ Configure the addon in Home Assistant:
 - OpenAI Realtime API integration
 - WebSocket server for ESP32 devices
 - Home Assistant MCP (Model Context Protocol) integration
-- Automatic Home Assistant area and label context added to system instructions
+- Automatic exposed-entity context added to system instructions, including entity names, aliases, devices, areas, and labels
 - Voice activity detection
 - Session management with automatic reuse
 - Optional audio recording for debugging
