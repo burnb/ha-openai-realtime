@@ -1,4 +1,5 @@
 """Main application entry point using Pipecat."""
+import copy
 import os
 import sys
 import asyncio
@@ -9,14 +10,17 @@ import dotenv
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
-from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 from pipecat.transports.websocket.server import WebsocketServerTransport
-from app.guarded_openai_service import GuardedOpenAIRealtimeLLMService
 from app.home_assistant_context import HomeAssistantContextService
 from app.mcp_service import HomeAssistantMCPService
-from app.disconnect_tool import get_disconnect_tool_definition, create_disconnect_tool_handler
+from app.runtime_openai_service import RuntimeOpenAIRealtimeLLMService
+from app.disconnect_tool import (
+    create_disconnect_tool_handler,
+    get_disconnect_tool_definition,
+    parse_disconnect_trigger_phrases,
+)
 from app.audio_recording_service import AudioRecordingService
-from app.session_manager import SessionManager
+from app.session_manager import SessionManager, approx_tokens_from_chars
 from app.websocket_handler import WebSocketHandler
 
 # Configure logging
@@ -43,13 +47,16 @@ class Application:
         self.runner: Optional[PipelineRunner] = None
         self.websocket_handler: Optional[WebSocketHandler] = None
         self.websocket_transport: Optional[WebsocketServerTransport] = None
-        self.openai_service: Optional[OpenAIRealtimeLLMService] = None
+        self.openai_service: Optional[RuntimeOpenAIRealtimeLLMService] = None
         self.mcp_service: Optional[HomeAssistantMCPService] = None
         self.ha_context_service: Optional[HomeAssistantContextService] = None
         self.audio_recording_service: Optional[AudioRecordingService] = None
         self.session_manager: Optional[SessionManager] = None
         self.current_task: Optional[PipelineTask] = None
         self._pipeline_lock: Optional[asyncio.Lock] = None
+        self._base_session_properties = None
+        self._base_mcp_tools_schema = None
+        self._base_all_tools: Optional[list[dict]] = None
         
     async def initialize(self) -> None:
         """Initialize all components."""
@@ -75,14 +82,12 @@ class Application:
         enable_recording = os.environ.get("ENABLE_RECORDING", "false").lower() == "true"
         
         # Get session reuse timeout and initialize session manager
-        session_reuse_timeout = float(os.environ.get("SESSION_REUSE_TIMEOUT_SECONDS", "120"))
-        max_cached_messages = int(os.environ.get("MAX_CACHED_MESSAGES", "5"))
-        self.session_manager = SessionManager(
-            reuse_timeout=session_reuse_timeout,
-            max_cached_messages=max_cached_messages,
-        )
+        session_reuse_timeout = float(os.environ.get("SESSION_REUSE_TIMEOUT_SECONDS", "300"))
+        self.session_manager = SessionManager(reuse_timeout=session_reuse_timeout)
         logger.info(f"Session reuse timeout: {session_reuse_timeout} seconds")
-        logger.info(f"Max cached messages per client: {max_cached_messages}")
+        disconnect_trigger_phrases = parse_disconnect_trigger_phrases(
+            os.environ.get("DISCONNECT_TRIGGER_PHRASES", "")
+        )
         
         if not openai_api_key:
             raise ValueError("OPENAI_API_KEY environment variable is required")
@@ -133,8 +138,14 @@ class Application:
         self.vad_threshold = vad_threshold
         self.vad_prefix_padding_ms = vad_prefix_padding_ms
         self.vad_silence_duration_ms = vad_silence_duration_ms
+        self.disconnect_trigger_phrases = disconnect_trigger_phrases
         self.instructions = instructions
         self.mcp_client = mcp_client
+        (
+            self._base_session_properties,
+            self._base_mcp_tools_schema,
+            self._base_all_tools,
+        ) = await self._build_session_configuration()
         
         # Initialize audio recording service (optional)
         self.audio_recording_service = AudioRecordingService(
@@ -165,10 +176,6 @@ class Application:
             return tool_names
         return None
 
-    def _approx_tokens_from_chars(self, char_count: int) -> int:
-        """Approximate token count from character count."""
-        return max(1, (char_count + 3) // 4) if char_count else 0
-
     def _log_session_payload_metrics(self, tools: list[dict], client_id: Optional[str]) -> None:
         """Log approximate prompt size contributors before session creation."""
         instructions_chars = len(self.instructions)
@@ -181,9 +188,9 @@ class Application:
             "📊 Session payload estimate for %s: instructions=%s chars (~%s tokens), tools=%s chars (~%s tokens, %s tools), cached_context=%s messages / %s chars (~%s tokens)",
             client_id or "server",
             instructions_chars,
-            self._approx_tokens_from_chars(instructions_chars),
+            approx_tokens_from_chars(instructions_chars),
             tools_chars,
-            self._approx_tokens_from_chars(tools_chars),
+            approx_tokens_from_chars(tools_chars),
             len(tools),
             cached_metrics["messages"],
             cached_metrics["chars"],
@@ -214,126 +221,123 @@ class Application:
         """Update session activity timestamp (called by SessionActivityTracker)."""
         pass
     
+    async def _build_session_configuration(self):
+        """Build current session properties and tool registrations."""
+        from pipecat.services.openai.realtime.events import (
+            SessionProperties,
+            AudioConfiguration,
+            AudioInput,
+            AudioOutput,
+            TurnDetection,
+            InputAudioTranscription,
+            InputAudioNoiseReduction,
+        )
+
+        disconnect_tool_def = get_disconnect_tool_definition(self.disconnect_trigger_phrases)
+        all_tools = [disconnect_tool_def]
+
+        mcp_tools_schema = None
+        if self.mcp_client:
+            try:
+                logger.info("🔧 Fetching MCP tool definitions...")
+                mcp_tools_schema = await self.mcp_client.get_tools_schema()
+                if self.mcp_service:
+                    mcp_tools_schema = self.mcp_service.filter_tools_schema(mcp_tools_schema)
+
+                for function_schema in mcp_tools_schema.standard_tools:
+                    openai_tool = {
+                        "type": "function",
+                        "name": function_schema.name,
+                        "description": function_schema.description,
+                        "parameters": {
+                            "type": "object",
+                            "properties": function_schema.properties,
+                            "required": function_schema.required,
+                        },
+                    }
+                    all_tools.append(openai_tool)
+
+                logger.info(f"✅ Fetched {len(mcp_tools_schema.standard_tools)} MCP tools")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to fetch MCP tool definitions: {e}")
+
+        session_properties = SessionProperties(
+            instructions=self.instructions,
+            audio=AudioConfiguration(
+                input=AudioInput(
+                    turn_detection=TurnDetection(
+                        type="server_vad",
+                        threshold=self.vad_threshold,
+                        prefix_padding_ms=self.vad_prefix_padding_ms,
+                        silence_duration_ms=self.vad_silence_duration_ms,
+                    ),
+                    transcription=InputAudioTranscription(
+                        model=self.openai_sst_model,
+                        language=self.openai_sst_language,
+                    ),
+                    # noise_reduction=InputAudioNoiseReduction(type="far_field"),
+                ),
+                output=AudioOutput(voice=self.openai_voice),
+            ),
+            tools=all_tools,
+        )
+
+        return session_properties, mcp_tools_schema, all_tools
+
     async def _ensure_openai_service(self, client_id: Optional[str] = None):
-        """Create or reuse the OpenAI service instance used by the pipeline.
+        """Create the shared OpenAI service and refresh its session for a client.
         
         Args:
-            client_id: Optional client ID to associate with the active service
+            client_id: Optional client ID for session management
         """
         if self._pipeline_lock is None:
             self._pipeline_lock = asyncio.Lock()
         
         async with self._pipeline_lock:
-            if self.openai_service is not None:
-                if client_id and self.session_manager:
-                    self.session_manager.set_current_service(client_id, self.openai_service)
-                    logger.info(f"♻️ Reusing active OpenAI session for client {client_id}")
-                return self.openai_service
-
-            logger.info("🆕 Creating OpenAI session for the pipeline...")
-            
-            # Create session properties with audio configuration
-            from pipecat.services.openai.realtime.events import (
-                SessionProperties,
-                AudioConfiguration,
-                AudioInput,
-                AudioOutput,
-                TurnDetection,
-                InputAudioTranscription,
-                InputAudioNoiseReduction
-            )
-            
-            # Create disconnect tool definition
-            disconnect_tool_def = get_disconnect_tool_definition()
-            
-            # Collect all tool definitions for session properties
-            all_tools = [disconnect_tool_def]
-            
-            # Get MCP tool definitions if available
-            mcp_tools_schema = None
-            if self.mcp_client:
-                try:
-                    logger.info("🔧 Fetching MCP tool definitions...")
-                    mcp_tools_schema = await self.mcp_client.get_tools_schema()
-                    if self.mcp_service:
-                        mcp_tools_schema = self.mcp_service.filter_tools_schema(mcp_tools_schema)
-                    
-                    # Convert MCP tool schemas to OpenAI format
-                    for function_schema in mcp_tools_schema.standard_tools:
-                        openai_tool = {
-                            "type": "function",
-                            "name": function_schema.name,
-                            "description": function_schema.description,
-                            "parameters": {
-                                "type": "object",
-                                "properties": function_schema.properties,
-                                "required": function_schema.required
-                            }
-                        }
-                        all_tools.append(openai_tool)
-                    
-                    logger.info(f"✅ Fetched {len(mcp_tools_schema.standard_tools)} MCP tools")
-                except Exception as e:
-                    logger.warning(f"⚠️ Failed to fetch MCP tool definitions: {e}")
-            
-            session_properties = SessionProperties(
-                instructions=self.instructions,
-                audio=AudioConfiguration(
-                    input=AudioInput(
-                        turn_detection=TurnDetection(
-                            type="server_vad",
-                            threshold=self.vad_threshold,
-                            prefix_padding_ms=self.vad_prefix_padding_ms,
-                            silence_duration_ms=self.vad_silence_duration_ms
-                        ),
-                        transcription=InputAudioTranscription(
-                            model=self.openai_sst_model,
-                            language=self.openai_sst_language
-                        ),
-                        noise_reduction=InputAudioNoiseReduction(type="far_field")
-                    ),
-                    output=AudioOutput(voice=self.openai_voice)
-                ),
-                tools=all_tools
-            )
-
+            session_properties = copy.deepcopy(self._base_session_properties)
+            mcp_tools_schema = self._base_mcp_tools_schema
+            all_tools = copy.deepcopy(self._base_all_tools) if self._base_all_tools else []
             self._log_session_payload_metrics(all_tools, client_id)
-            
-            logger.info(f"🔧 Creating session with {len(all_tools)} tools: {[tool.get('name', 'unknown') for tool in all_tools]}")
-            
-            # Create new service instance
-            self.openai_service = GuardedOpenAIRealtimeLLMService(
-                api_key=self.openai_api_key,
-                model=self.openai_model,
-                session_properties=session_properties,
-                start_audio_paused=False
-            )
-            logger.info(f"✅ OpenAI Service created: {type(self.openai_service).__name__}")
-            
-            # Register disconnect tool handler
-            disconnect_tool_handler = create_disconnect_tool_handler(self.websocket_transport)
-            self.openai_service.register_function("disconnect_client", disconnect_tool_handler)
-            logger.info("✅ Registered disconnect tool handler")
-            
-            # Register MCP tool handlers if available
-            if self.mcp_client and mcp_tools_schema:
-                try:
-                    await self.mcp_client.register_tools_schema(mcp_tools_schema, self.openai_service)
-                    logger.info(f"✅ Registered {len(mcp_tools_schema.standard_tools)} MCP tool handlers")
-                except Exception as e:
-                    logger.warning(f"⚠️ Failed to register MCP tool handlers: {e}")
-            
-            # Register service with session manager
-            if client_id:
+
+            if self.openai_service is None:
+                logger.info(f"🔧 Creating session with {len(all_tools)} tools: {[tool.get('name', 'unknown') for tool in all_tools]}")
+                self.openai_service = RuntimeOpenAIRealtimeLLMService(
+                    api_key=self.openai_api_key,
+                    model=self.openai_model,
+                    session_properties=session_properties,
+                    start_audio_paused=False,
+                )
+                logger.info(f"✅ OpenAI Service created: {type(self.openai_service).__name__}")
+
+                disconnect_tool_handler = create_disconnect_tool_handler(self.websocket_transport)
+                self.openai_service.register_function("disconnect_client", disconnect_tool_handler)
+                logger.info("✅ Registered disconnect tool handler")
+
+                if self.mcp_client and mcp_tools_schema:
+                    try:
+                        await self.mcp_client.register_tools_schema(mcp_tools_schema, self.openai_service)
+                        logger.info(f"✅ Registered {len(mcp_tools_schema.standard_tools)} MCP tool handlers")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Failed to register MCP tool handlers: {e}")
+
+            self.openai_service._settings.session_properties = session_properties
+
+            if client_id and self.session_manager:
+                runtime_aggregator = self.session_manager.activate_runtime_context(client_id, "server")
                 self.session_manager.set_current_service(client_id, self.openai_service)
-            
-            logger.info("✅ New OpenAI Session created")
+                await self.openai_service.reset_runtime_session(
+                    context=runtime_aggregator.user().context,
+                    session_properties=session_properties,
+                )
+                logger.info(f"✅ Refreshed OpenAI runtime session for client {client_id}")
+
             return self.openai_service
     
     async def run(self) -> None:
         """Run the application."""
         await self.initialize()
         
+        # Create initial OpenAI service (will be replaced per connection)
         await self._ensure_openai_service()
         
         # Build pipeline - based on pipecat-examples, one pipeline handles all connections
@@ -347,27 +351,19 @@ class Application:
             if self.audio_recording_service:
                 self.audio_recording_service.start_new_session(client_id)
         
-        def on_client_disconnected(client_id: str):
+        async def on_client_disconnected(client_id: str):
             """Handle client disconnection."""
             if self.session_manager:
                 self.session_manager.handle_client_disconnect(client_id, self.openai_service)
             if self.audio_recording_service:
                 self.audio_recording_service.stop_recording()
-        
-        # Function to get OpenAI service for a client
-        def get_openai_service_for_client(client_id: str) -> Optional[OpenAIRealtimeLLMService]:
-            """Get OpenAI service for a specific client."""
-            if self.session_manager:
-                service = self.session_manager.get_current_service(client_id)
-                if service is not None:
-                    return service
-            return self.openai_service
+            if self.openai_service:
+                await self.openai_service.close_runtime_session()
         
         self.websocket_handler.setup_event_handlers(
             transport=self.websocket_transport,
             on_client_connected_callback=on_client_connected,
             on_client_disconnected_callback=on_client_disconnected,
-            openai_service_getter=get_openai_service_for_client
         )
         
         try:
@@ -381,11 +377,11 @@ class Application:
             logger.error(f"Fatal error: {e}", exc_info=True)
             raise
         finally:
-            await self.cleanup()
+            await self.shutdown()
     
-    async def cleanup(self) -> None:
+    async def shutdown(self) -> None:
         """Cleanup resources."""
-        logger.info("Cleaning up application...")
+        logger.info("Gracefully shutting down application...")
         
         if self.runner:
             try:
@@ -402,7 +398,7 @@ class Application:
         if self.audio_recording_service:
             self.audio_recording_service.cleanup()
         
-        logger.info("✅ Application cleanup complete")
+        logger.info("✅ Application shutdown complete")
 
 
 async def main() -> None:

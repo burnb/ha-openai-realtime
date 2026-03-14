@@ -3,13 +3,18 @@ import json
 import logging
 import time
 from typing import Optional, Dict, List, Any
-from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_context import LLMContext, NOT_GIVEN
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 from pipecat.frames.frames import Frame, StartFrame, LLMMessagesUpdateFrame
 
 logger = logging.getLogger(__name__)
+
+
+def approx_tokens_from_chars(char_count: int) -> int:
+    """Approximate token count from character count."""
+    return max(1, (char_count + 3) // 4) if char_count else 0
 
 
 class ContextCacheEntry:
@@ -28,15 +33,13 @@ class SessionManager:
     closed within the reuse timeout period.
     """
     
-    def __init__(self, reuse_timeout: float = 300.0, max_cached_messages: int = 8):
+    def __init__(self, reuse_timeout: float = 300.0):
         """Initialize session manager.
         
         Args:
             reuse_timeout: Time in seconds after which cached context expires
-            max_cached_messages: Maximum number of recent messages to carry over
         """
         self.reuse_timeout = reuse_timeout
-        self.max_cached_messages = max_cached_messages
         # Dictionary mapping client_id to ContextCacheEntry
         self.context_caches: Dict[str, ContextCacheEntry] = {}
         # Dictionary mapping client_id to current service
@@ -93,12 +96,7 @@ class SessionManager:
         # Cache the context if we found one
         if context:
             messages = context.get_messages() if hasattr(context, 'get_messages') else []
-            pruned_messages = self._prune_messages(messages)
-            message_count = len(pruned_messages)
-            if hasattr(context, 'set_messages'):
-                context.set_messages(pruned_messages)
-            elif hasattr(context, '_messages'):
-                context._messages = pruned_messages
+            message_count = len(messages) if messages else 0
             self.context_caches[client_id] = ContextCacheEntry(
                 context=context,
                 timestamp=time.time()
@@ -135,7 +133,7 @@ class SessionManager:
         if cached_context:
             # Create a new context instance with the same messages
             # Use the constructor to properly copy messages and tools
-            cached_messages = self._prune_messages(cached_context.get_messages())
+            cached_messages = cached_context.get_messages()
             new_context = LLMContext(
                 messages=cached_messages.copy() if cached_messages else None,
                 tools=cached_context.tools if hasattr(cached_context, 'tools') else None,
@@ -175,6 +173,53 @@ class SessionManager:
             aggregator_pair: The LLMContextAggregatorPair instance for this client
         """
         self.context_aggregators[client_id] = aggregator_pair
+
+    def activate_runtime_context(
+        self,
+        client_id: str,
+        runtime_client_id: str = "server",
+    ) -> LLMContextAggregatorPair:
+        """Load a client's cached context into the shared runtime aggregator.
+
+        Args:
+            client_id: Real websocket client id
+            runtime_client_id: Shared pipeline/runtime owner id
+
+        Returns:
+            The shared runtime aggregator pair
+        """
+        aggregator_pair = self.context_aggregators.get(runtime_client_id)
+        if not aggregator_pair:
+            raise RuntimeError(
+                f"Context aggregator for runtime {runtime_client_id} has not been initialized"
+            )
+
+        cached_context = self.create_context_for_new_session(client_id)
+        runtime_context = aggregator_pair.user().context
+        runtime_context.set_messages(cached_context.get_messages().copy())
+        runtime_context.set_tools(cached_context.tools if hasattr(cached_context, "tools") else NOT_GIVEN)
+        runtime_context.set_tool_choice(
+            cached_context.tool_choice if hasattr(cached_context, "tool_choice") else NOT_GIVEN
+        )
+
+        self.context_aggregators[client_id] = aggregator_pair
+        logger.info(
+            "🔄 Activated shared runtime context for client %s with %s cached messages",
+            client_id,
+            len(runtime_context.get_messages()),
+        )
+        return aggregator_pair
+
+    def clear_runtime_context(self, runtime_client_id: str = "server"):
+        """Clear the shared runtime aggregator after the active client disconnects."""
+        aggregator_pair = self.context_aggregators.get(runtime_client_id)
+        if not aggregator_pair:
+            return
+
+        runtime_context = aggregator_pair.user().context
+        runtime_context.set_messages([])
+        runtime_context.set_tools(NOT_GIVEN)
+        runtime_context.set_tool_choice(NOT_GIVEN)
     
     def remove_context_aggregator(self, client_id: str):
         """Remove the context aggregator pair for a client.
@@ -194,10 +239,9 @@ class SessionManager:
         Args:
             client_id: Unique identifier for the client device
         """
-        # Cache context from service/aggregator
-        if client_id in self.current_services:
-            self.cache_context_from_service(client_id, self.current_services[client_id])
-            del self.current_services[client_id]
+        service = self._pop_current_service(client_id)
+        if service:
+            self.cache_context_from_service(client_id, service)
         
         # Remove context aggregator (will be recreated for new session)
         self.remove_context_aggregator(client_id)
@@ -220,23 +264,12 @@ class SessionManager:
         """Return approximate size metrics for cached context for diagnostics."""
         cached_context = self.get_cached_context(client_id)
         messages = cached_context.get_messages() if cached_context and hasattr(cached_context, 'get_messages') else []
-        pruned_messages = self._prune_messages(messages)
-        total_chars = sum(self._message_size_chars(message) for message in pruned_messages)
+        total_chars = sum(self._message_size_chars(message) for message in messages)
         return {
-            "messages": len(pruned_messages),
+            "messages": len(messages),
             "chars": total_chars,
             "approx_tokens": self._approx_tokens(total_chars),
         }
-
-    def _prune_messages(self, messages: Optional[List[Any]]) -> List[Any]:
-        """Keep only the most recent messages to control token growth."""
-        if not messages:
-            return []
-        if self.max_cached_messages <= 0:
-            return []
-        if len(messages) <= self.max_cached_messages:
-            return list(messages)
-        return list(messages[-self.max_cached_messages:])
 
     def _message_size_chars(self, message: Any) -> int:
         """Estimate message size in characters for logging."""
@@ -254,7 +287,16 @@ class SessionManager:
 
     def _approx_tokens(self, char_count: int) -> int:
         """Approximate token count from character count."""
-        return max(1, (char_count + 3) // 4) if char_count else 0
+        return approx_tokens_from_chars(char_count)
+
+    def _pop_current_service(
+        self,
+        client_id: str,
+        fallback_service: Optional[OpenAIRealtimeLLMService] = None,
+    ) -> Optional[OpenAIRealtimeLLMService]:
+        """Return the tracked service for a client and remove it from the active map."""
+        service = self.current_services.pop(client_id, None)
+        return service or fallback_service
     
     def create_context_initializer(self, client_id: str, context_aggregator: LLMContextAggregatorPair) -> Optional['ContextInitializer']:
         """Create a context initializer if cached messages exist.
@@ -283,24 +325,19 @@ class SessionManager:
             service: Optional service instance to cache context from
         """
         logger.info(f"🔌 Client {client_id} disconnected - caching context")
-        
-        # Get service to cache from
-        service_to_cache = None
-        if client_id in self.current_services:
-            service_to_cache = self.current_services[client_id]
-        elif service:
-            service_to_cache = service
+        service_to_cache = self._pop_current_service(client_id, service)
         
         if service_to_cache:
             try:
                 self.cache_context_from_service(client_id, service_to_cache)
-                if client_id in self.current_services:
-                    del self.current_services[client_id]
                 logger.info(f"💾 Cached context for disconnected client {client_id}")
             except Exception as e:
                 logger.warning(f"⚠️ Error caching context for disconnected client {client_id}: {e}")
         else:
             logger.debug(f"No service found to cache context for client {client_id}")
+
+        self.clear_runtime_context()
+        self.remove_context_aggregator(client_id)
 
 
 class ContextInitializer(FrameProcessor):
@@ -334,4 +371,3 @@ class ContextInitializer(FrameProcessor):
             return
         
         await self.push_frame(frame, direction)
-

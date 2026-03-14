@@ -18,10 +18,8 @@ RUN \
     && poetry config virtualenvs.create false \
     && poetry config virtualenvs.in-project false
 
-# Copy Poetry configuration files and app directory for package installation
+# Copy only dependency manifests so app code changes do not invalidate this layer
 COPY pyproject.toml poetry.lock* /tmp/
-RUN mkdir -p /tmp/openai_realtime_voice_agent
-COPY app/ /tmp/openai_realtime_voice_agent/app/
 
 # Install dependencies using Poetry
 WORKDIR /tmp

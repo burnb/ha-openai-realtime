@@ -13,29 +13,20 @@ import websockets
 logger = logging.getLogger(__name__)
 
 CONVERSATION_ASSISTANT = "conversation"
-MAX_AREAS = 20
-MAX_ENTITIES = 40
 
 
 @dataclass
 class HomeAssistantEntitySummary:
     """Compact metadata for one exposed Home Assistant entity."""
 
-    entity_id: str
     names: List[str]
-    device_name: Optional[str]
     area_names: List[str]
-    label_names: List[str]
 
     def to_instruction_lines(self) -> List[str]:
         """Render the entity as a compact instruction block."""
-        lines = [f"- names: {', '.join(self.names)}", f"  entity_id: {self.entity_id}"]
-        if self.device_name:
-            lines.append(f"  device: {self.device_name}")
+        lines = [f"- names: {', '.join(self.names)}"]
         if self.area_names:
             lines.append(f"  areas: {', '.join(self.area_names)}")
-        if self.label_names:
-            lines.append(f"  labels: {', '.join(self.label_names)}")
         return lines
 
 
@@ -49,9 +40,8 @@ class HomeAssistantContextSnapshot:
     def to_instructions(self) -> str:
         """Render the snapshot as a compact system instruction suffix."""
         lines = [
-            "",
-            "Home Assistant static context for exposed voice-assistant entities:",
-            "Use entity names, aliases, device names, area names, and labels from this context when calling Home Assistant tools.",
+            "Use exact Home Assistant entity and area names when calling tools. Do not invent entity names and area names.",
+            "Home Assistant static context:",
         ]
 
         if self.areas:
@@ -86,7 +76,6 @@ class HomeAssistantContextService:
                 areas = await self._send_command(websocket, {"type": "config/area_registry/list"})
                 devices = await self._send_command(websocket, {"type": "config/device_registry/list"})
                 entities = await self._send_command(websocket, {"type": "config/entity_registry/list"})
-                labels = await self._send_command(websocket, {"type": "config/label_registry/list"})
                 exposed_entities = await self._send_command(
                     websocket,
                     {"type": "homeassistant/expose_entity/list"},
@@ -115,7 +104,6 @@ class HomeAssistantContextService:
             snapshot = self._build_snapshot(
                 areas,
                 devices,
-                labels,
                 entity_details,
                 exposed_entities,
                 bool(expose_new.get("expose_new")),
@@ -163,7 +151,6 @@ class HomeAssistantContextService:
         self,
         areas: Iterable[Dict[str, Any]],
         devices: Iterable[Dict[str, Any]],
-        labels: Iterable[Dict[str, Any]],
         entity_details: Dict[str, Optional[Dict[str, Any]]],
         exposed_entities: Dict[str, Any],
         expose_new: bool,
@@ -177,11 +164,6 @@ class HomeAssistantContextService:
             device["id"]: device
             for device in devices
             if device.get("id")
-        }
-        label_lookup = {
-            label["label_id"]: label.get("name", "").strip()
-            for label in labels
-            if label.get("label_id") and label.get("name")
         }
         explicitly_exposed_ids = self._get_explicitly_exposed_entity_ids(exposed_entities)
 
@@ -197,30 +179,22 @@ class HomeAssistantContextService:
             ):
                 continue
 
-            summary = self._build_entity_summary(entity, area_lookup, device_lookup, label_lookup)
+            summary = self._build_entity_summary(entity, area_lookup, device_lookup)
             if not summary:
                 continue
             summaries.append(summary)
-            seen_entity_ids.add(summary.entity_id)
-            if len(summaries) >= MAX_ENTITIES:
-                break
+            seen_entity_ids.add(entity_id)
 
         for entity_id in sorted(explicitly_exposed_ids - seen_entity_ids):
             summaries.append(
                 HomeAssistantEntitySummary(
-                    entity_id=entity_id,
                     names=[entity_id],
-                    device_name=None,
                     area_names=[],
-                    label_names=[],
                 )
             )
-            if len(summaries) >= MAX_ENTITIES:
-                break
 
-        known_areas = self._dedupe_and_limit(
+        known_areas = self._dedupe(
             [area_name for summary in summaries for area_name in summary.area_names],
-            limit=MAX_AREAS,
         )
 
         return HomeAssistantContextSnapshot(areas=known_areas, entities=summaries)
@@ -230,7 +204,6 @@ class HomeAssistantContextService:
         entity: Dict[str, Any],
         area_lookup: Dict[str, Dict[str, Any]],
         device_lookup: Dict[str, Dict[str, Any]],
-        label_lookup: Dict[str, str],
     ) -> Optional[HomeAssistantEntitySummary]:
         entity_id = entity.get("entity_id")
         if not entity_id:
@@ -244,37 +217,22 @@ class HomeAssistantContextService:
         elif device and device.get("area_id"):
             area = area_lookup.get(device.get("area_id"))
 
-        names = self._dedupe_and_limit(
+        names = self._dedupe(
             [
                 self._clean_text(entity.get("name")),
-                self._clean_text(entity.get("original_name")),
                 *self._clean_string_list(entity.get("aliases")),
-                entity_id,
             ],
-            limit=6,
         )
-        area_names = self._dedupe_and_limit(
+        area_names = self._dedupe(
             [
                 self._clean_text(area.get("name")) if area else None,
                 *self._clean_string_list(area.get("aliases") if area else None),
             ],
-            limit=4,
-        )
-        label_names = self._dedupe_and_limit(
-            [
-                *self._label_names(entity.get("labels"), label_lookup),
-                *self._label_names(device.get("labels") if device else None, label_lookup),
-                *self._label_names(area.get("labels") if area else None, label_lookup),
-            ],
-            limit=6,
         )
 
         return HomeAssistantEntitySummary(
-            entity_id=entity_id,
             names=names,
-            device_name=self._resolve_device_name(device),
             area_names=area_names,
-            label_names=label_names,
         )
 
     def _select_candidate_entity_ids(
@@ -291,8 +249,7 @@ class HomeAssistantContextService:
                 entity_id = entity.get("entity_id")
                 if not entity_id or entity.get("hidden_by") or entity.get("disabled_by"):
                     continue
-                if self._should_include_entity(entity_id):
-                    candidates.add(entity_id)
+                candidates.add(entity_id)
 
         return sorted(candidates)
 
@@ -322,24 +279,7 @@ class HomeAssistantContextService:
             return False
         if entity_id in explicitly_exposed_ids:
             return True
-        return expose_new and self._should_include_entity(entity_id)
-
-    def _resolve_device_name(self, device: Optional[Dict[str, Any]]) -> Optional[str]:
-        if not device:
-            return None
-
-        for value in (device.get("name_by_user"), device.get("name")):
-            cleaned = self._clean_text(value)
-            if cleaned:
-                return cleaned
-
-        manufacturer = self._clean_text(device.get("manufacturer"))
-        model = self._clean_text(device.get("model"))
-        combined = " ".join(part for part in [manufacturer, model] if part)
-        return combined or None
-
-    def _label_names(self, label_ids: Any, label_lookup: Dict[str, str]) -> List[str]:
-        return [label_lookup[label_id] for label_id in label_ids or [] if label_lookup.get(label_id)]
+        return expose_new
 
     def _clean_string_list(self, values: Any) -> List[str]:
         if not values:
@@ -352,23 +292,7 @@ class HomeAssistantContextService:
         text = str(value).strip()
         return text or None
 
-    def _should_include_entity(self, entity_id: str) -> bool:
-        domain = entity_id.split(".", 1)[0]
-        return domain in {
-            "light",
-            "switch",
-            "climate",
-            "cover",
-            "fan",
-            "media_player",
-            "vacuum",
-            "scene",
-            "script",
-            "lock",
-            "input_boolean",
-        }
-
-    def _dedupe_and_limit(self, values: Iterable[Any], limit: int) -> List[str]:
+    def _dedupe(self, values: Iterable[Any]) -> List[str]:
         deduped: List[str] = []
         seen = set()
         normalized_values = sorted(
@@ -381,8 +305,6 @@ class HomeAssistantContextService:
                 continue
             seen.add(value)
             deduped.append(value)
-            if len(deduped) >= limit:
-                break
         return deduped
 
     def _build_websocket_url(self, mcp_url: str) -> str:

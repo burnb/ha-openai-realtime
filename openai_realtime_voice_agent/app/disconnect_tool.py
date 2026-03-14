@@ -10,13 +10,31 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_DISCONNECT_TRIGGER_PHRASES = [
+    "Auf Wiedersehen",
+    "Tschuess",
+    "Tschüss",
+    "Stop",
+    "Beenden",
+    "Ende",
+]
 
-def get_disconnect_tool_definition() -> Dict[str, Any]:
+def parse_disconnect_trigger_phrases(configured_phrases: Optional[str]) -> list[str]:
+    """Return disconnect trigger phrases from a comma-separated string or defaults."""
+    if not configured_phrases:
+        return DEFAULT_DISCONNECT_TRIGGER_PHRASES
+
+    phrases = [phrase.strip() for phrase in configured_phrases.split(",") if phrase.strip()]
+    return phrases or DEFAULT_DISCONNECT_TRIGGER_PHRASES
+
+
+def get_disconnect_tool_definition(trigger_phrases: Optional[list[str]] = None) -> Dict[str, Any]:
     """Get the tool definition for OpenAI Realtime API."""
+    phrases = ", ".join(f"{phrase}" for phrase in trigger_phrases or DEFAULT_DISCONNECT_TRIGGER_PHRASES)
     return {
         "type": "function",
         "name": "disconnect_client",
-        "description": "Disconnect the voice assistant session when the user says goodbye, farewell, stop, or only thank you without additional questions and wants to end the conversation. Use this when the user explicitly wants to end the conversation or says phrases like 'Auf Wiedersehen', 'Tschüss', 'Stop', 'Beenden', 'Ende', etc.",
+        "description": "Disconnect the voice assistant session when the user says " + phrases + " without additional questions and wants to end the conversation. Use this when the user explicitly wants to end the conversation or says phrases like " + phrases + ".",
         "parameters": {
             "type": "object",
             "properties": {
